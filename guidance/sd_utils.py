@@ -73,6 +73,7 @@ class StableDiffusion(nn.Module):
         )
 
         del pipe
+        # 1245125
 
         self.num_train_timesteps = self.scheduler.config.num_train_timesteps
         self.min_step = int(self.num_train_timesteps * t_range[0])
