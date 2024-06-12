@@ -1,0 +1,1 @@
+Namespace(data_device='cuda', eval=False, images='images', model_path='./edit/pth', resolution=-1, sh_degree=3, source_path='/home/yjx/desktop/GaussianEditor/dataset/360_v2/bicycle', white_background=False)

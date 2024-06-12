@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="yjx@10.12.13.86:22 key" remoteFilesAllowedToDisappearOnAutoupload="false">
+  <component name="PublishConfigData" serverName="yjx@10.12.13.103:22 key" remoteFilesAllowedToDisappearOnAutoupload="false">
     <serverData>
       <paths name="yjx@10.12.13.103:22 key">
         <serverdata>
@@ -26,7 +26,7 @@
       <paths name="yjx@10.12.13.86:22 key">
         <serverdata>
           <mappings>
-            <mapping deploy="/home/yjx/desktop/style" local="$PROJECT_DIR$" />
+            <mapping deploy="/desktop/style" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>
@@ -58,7 +58,13 @@
           </mappings>
         </serverdata>
       </paths>
+      <paths name="yjx@10.12.13.86:22 key (6)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/home/yjx/desktop/style" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
     </serverData>
-    <option name="myAutoUpload" value="ALWAYS" />
   </component>
 </project>

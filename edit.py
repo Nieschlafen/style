@@ -1,7 +1,6 @@
 import os
 import torch
 import time
-import datetime
 import math
 import torchvision
 import numpy as np
@@ -9,6 +8,7 @@ import ui_utils
 import viser
 import viser.transforms as tf
 import random
+from PIL import Image
 from tqdm import tqdm
 from threestudio.utils.typing import *  # Dict
 from omegaconf import OmegaConf
@@ -23,6 +23,7 @@ from gaussiansplatting.arguments import (
     OptimizationParams,
 )
 from initialize.EditGuidance import EditGuidance
+from initialize.CustomGuidance import CustomGuidance
 from gaussiansplatting.gaussian_renderer import render
 from arguments import ModelParams
 
@@ -66,7 +67,7 @@ class editpara:
         self.anchor_weight_init_g0 = 0.05
         self.anchor_weight_init = 0.1
         self.anchor_weight_multiplier = 1.3
-        self.edit_train_steps = 1500
+        self.edit_train_steps = 30
         self.gs_lr_scaler = 3.0
         self.gs_lr_end_scaler = 2.0
         self.color_lr_scaler = 3.0
@@ -74,7 +75,7 @@ class editpara:
         self.scaling_lr_scaler = 2.0
         self.rotation_lr_scaler = 2.0
         self.sam_enabled = False
-        self.edit_cam_num = 50
+        self.edit_cam_num = 1  # cam number
         # guidance parameter
         self.per_editing_step = 10
         self.edit_begin_step = 0
@@ -97,6 +98,7 @@ class editpara:
         # diffusion model
         self.ip2p = None
         self.stn_ip2p = None
+        self.ctn = None
 
         self.ctn_inpaint = None
         self.training = False
@@ -113,6 +115,7 @@ class editpara:
         self.origin_frames = {}
         self.masks_2D = {}
 
+        self.epoch = 0
         self.text_segmentor = LangSAMTextSegmentor().to(get_device())
         self.sam_predictor = self.text_segmentor.model.sam
         self.sam_predictor.is_image_set = True
@@ -122,6 +125,7 @@ class editpara:
 
         self.parser = ArgumentParser(description="Training script parameters")
         self.pipe = PipelineParams(self.parser)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=False)
         self.server = viser.ViserServer(port=self.port)
 
         with self.server.add_gui_folder("Editor"):
@@ -129,7 +133,7 @@ class editpara:
                 "Edit Type", ("Edit",)
             )
             self.guidance_type = self.server.add_gui_dropdown(
-                "Guidance Type", ("InstructPix2Pix", "instantstyle")
+                "Guidance Type", ("InstructPix2Pix", "instantstyle", "custom")
             )
             self.edit_frame_show = self.server.add_gui_checkbox(
                 "Show Edit Frame", initial_value=True, visible=False
@@ -179,17 +183,16 @@ class editpara:
                 anchor_weight_init=self.anchor_weight_init,
                 anchor_weight_multiplier=self.anchor_weight_multiplier,
             )
-
             self.edit_frame_show.visible = True
             edit_cameras, train_frames, train_frustums = ui_utils.sample_train_camera(self.colmap_cameras,
                                                                                       self.edit_cam_num,
                                                                                       self.server)
             if self.edit_type.value == "Edit":
                 self.edit(edit_cameras, train_frames, train_frustums)
-
                 ui_utils.remove_all(train_frames)
                 ui_utils.remove_all(train_frustums)
                 self.edit_frame_show.visible = False
+
             self.guidance = None
             self.training = False
             self.gaussian.anchor_postfix()
@@ -319,21 +322,35 @@ class editpara:
             print("using InstructPix2Pix!")
         elif self.guidance_type.value == "instantstyle":
             if not self.stn_ip2p:
-                from threestudio.models.guidance.instantstyle_guidance import (
-                        InstantStyleGuidance,
+                from threestudio.models.guidance.instantstyle_guidance2 import (
+                        newInstantStyleGuidance,
                 )
 
-                self.stn_ip2p = InstantStyleGuidance(
+                self.stn_ip2p = newInstantStyleGuidance(
                     OmegaConf.create({"min_step_percent": 0.05,
                                       "max_step_percent": 0.8,
                                      })
                 )
             cur_2D_guidance = self.stn_ip2p
             print("using instantstyle!")
+        elif self.guidance_type.value == "custom":
+            if not self.ctn:
+                from threestudio.models.guidance.custom_guidance import (
+                        CustomStyleGuidance,
+                )
+
+                self.ctn = CustomStyleGuidance(
+                    OmegaConf.create({"min_step_percent": 0.02,
+                                      "max_step_percent": 0.98,
+                                      "text_prompt": self.edit_text.value,
+                                     })
+                )
+            cur_2D_guidance = self.ctn
+            print("using customstyle!")
 
         origin_frames = self.render_cameras_list(edit_cameras)  # 原始帧
         # * EditGuidance and cur_2D_guidance *
-        self.guidance = EditGuidance(
+        self.guidance = CustomGuidance(
             guidance=cur_2D_guidance,
             gaussian=self.gaussian,
             origin_frames=origin_frames,
@@ -359,18 +376,33 @@ class editpara:
             view_index = random.choice(view_index_stack)
             view_index_stack.remove(view_index)
 
-            rendering = self.render(edit_cameras[view_index], train=True)["comp_rgb"]  # 通道变化
-
+            rendering = self.render(edit_cameras[view_index], train=True)["comp_rgb"]  # 1 H W C
+            self.save_rendering(rendering, view_index)
             loss = self.guidance(rendering, view_index, step)
+            # print("loss_sds:"+str(loss.item()))
+            # self.densify_and_prune(step)
             loss.backward()
-
-            self.densify_and_prune(step)
-
             self.gaussian.optimizer.step()
             self.gaussian.optimizer.zero_grad(set_to_none=True)
-            if self.stop_training:
+
+            if self.stop_training:  # end train
                 self.stop_training = False
                 return
+
+    def save_rendering(self, rendering, view_index):
+        # Assuming rendering is a tensor with shape (1, H, W, C)
+        rendering = rendering.squeeze(0)  # Remove the batch dimension, new shape (H, W, C)
+        rendering = rendering.detach().cpu().numpy()  # Convert to numpy array if it's a tensor
+
+        # Convert rendering to uint8 if necessary (assuming rendering is in the range [0, 1])
+        rendering = (rendering * 255).astype(np.uint8)
+
+        # Convert to Image object and save
+        image = Image.fromarray(rendering)
+        output_dir = "./renderings"
+        image_path = os.path.join(output_dir, f"rendering_{view_index}.png")
+        os.makedirs(os.path.dirname(image_path), exist_ok=True)
+        image.save(image_path)
 
     @torch.no_grad()
     def render_cameras_list(self, edit_cameras):
@@ -433,7 +465,7 @@ class editpara:
         render_pkg["masks"] = semantic_map[None]  # 1, 1, H, W
 
         image = image.permute(1, 2, 0)[None]  # C H W to 1 H W C
-        render_pkg["comp_rgb"] = image  # 1 H W C
+        render_pkg["comp_rgb"] = image
 
         depth = render_pkg["depth_3dgs"]
         depth = depth.permute(1, 2, 0)[None]

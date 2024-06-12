@@ -41,8 +41,18 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
 
-    def __init__(self, sh_degree : int):
+    def __init__(self, sh_degree : int,
+                 anchor_weight_init_g0: float,
+                 anchor_weight_init: float,
+                 anchor_weight_multiplier: float,
+                 ):
         self.active_sh_degree = 0
+        self._anchor_loss_schedule = torch.tensor(
+            [anchor_weight_init_g0], device="cuda"
+        )  # generation 0 begin from weight 0
+        self.anchor_weight_init_g0 = anchor_weight_init_g0
+        self.anchor_weight_init = anchor_weight_init
+        self.anchor_weight_multiplier = anchor_weight_multiplier
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
         self._features_dc = torch.empty(0)

@@ -1,11 +1,14 @@
+import torch
 
-from threestudio.utils.misc import get_device
+from threestudio.utils.misc import get_device, step_check, dilate_mask, erode_mask, fill_closed_areas
 from threestudio.utils.perceptual import PerceptualLoss
-from threestudio.models.prompt_processors.stable_diffusion_prompt_processor import StableDiffusionPromptProcessor
 import ui_utils
+from threestudio.models.prompt_processors.stable_diffusion_prompt_processor import StableDiffusionPromptProcessor
+
+
 # Diffusion model (cached) + prompts + edited_frames + training config
 
-class CustomGuidance:
+class EditGuidance:
     def __init__(self, guidance, gaussian, origin_frames, text_prompt, per_editing_step, edit_begin_step,
                  edit_until_step, lambda_l1, lambda_p, lambda_anchor_color, lambda_anchor_geo, lambda_anchor_scale,
                  lambda_anchor_opacity, train_frames, train_frustums, cams, server
@@ -29,12 +32,15 @@ class CustomGuidance:
         self.edit_frames = {}
         self.visible = True
         self.global_step = 0
-        """self.prompt_guidance = StableDiffusionPromptProcessor(
+        self.prompt_utils = StableDiffusionPromptProcessor(
             {
-                "pretrained_model_name_or_path": "/home/llq/Data/model_weight/runwayml/stable-diffusion-v1-5",
+                "pretrained_model_name_or_path": "runwayml/stable-diffusion-v1-5",
                 "prompt": text_prompt,
             }
-        )()"""
+        )()
+        # self.perceptual_loss = PerceptualLoss().eval().to(get_device())
+        self.perceptual_loss = PerceptualLoss().train().to(get_device())
+
 
     def __call__(self, rendering, view_index, step):
         self.gaussian.update_learning_rate(step)
@@ -47,11 +53,23 @@ class CustomGuidance:
                 < self.edit_until_step
                 and step % self.per_editing_step == 0
         ):
-            loss, loss_dict = self.guidance(
+            result = self.guidance(
                 rendering,
-                self.global_step,
                 self.origin_frames[view_index],
+                self.prompt_utils,
             )
+            self.edit_frames[view_index] = result["edit_images"].detach().clone() # 1 H W C
+            self.train_frustums[view_index].remove()
+            self.train_frustums[view_index] = ui_utils.new_frustums(view_index, self.train_frames[view_index],
+                                                                    self.cams[view_index], self.edit_frames[view_index], self.visible, self.server)
+            # print("edited image index", cur_index)
+
+        gt_image = self.edit_frames[view_index]
+
+        loss = self.lambda_l1 * torch.nn.functional.l1_loss(rendering, gt_image) + \
+               self.lambda_p * self.perceptual_loss(rendering.permute(0, 3, 1, 2).contiguous(),
+                                                    gt_image.permute(0, 3, 1, 2).contiguous(), ).sum()
+
         # anchor loss
         if (
                 self.lambda_anchor_color > 0

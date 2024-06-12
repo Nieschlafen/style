@@ -19,6 +19,7 @@ class StableDiffusion(nn.Module):
         print(f'[INFO] loading stable diffusion...')
 
         model_key = "runwayml/stable-diffusion-v1-5"
+        pretrained_model_name_or_path = "/home/llq/Data/model_weight/runwayml/stable-diffusion-v1-5"
         base_model_path = "diffusers/stable-diffusion-xl-1.0-inpainting-0.1"
         image_encoder_path = "/data_heat/jcx/InstantStyle/sdxl_models/image_encoder"
         ip_ckpt = "/data_heat/jcx/InstantStyle/sdxl_models/ip-adapter_sdxl.bin"
@@ -30,9 +31,7 @@ class StableDiffusion(nn.Module):
             variant="fp16",
             use_safetensors=True,
         )"""
-        self.pipe = DiffusionPipeline.from_pretrained(model_key).to(self.device)
-
-        self.pipe.enable_vae_tiling()
+        self.pipe = DiffusionPipeline.from_pretrained(pretrained_model_name_or_path).to(self.device)
         self.vae = self.pipe.vae
         self.tokenizer = self.pipe.tokenizer
         self.text_encoder = self.pipe.text_encoder
@@ -81,12 +80,12 @@ class StableDiffusion(nn.Module):
     def set_system(self, system):
         self.system = system
 
-    def train_step(self, latents, text_embeddings, system=None, t_ratio=1):#n,12
+    def train_step(self, latents, text_embeddings, system, t_ratio=1):#n,12
         # guidance_scale = self.opt.guidance_scale
         guidance_scale = self.opt.cfg
 
         if self.opt.stage_time:
-            cur_iters = system.global_step
+            cur_iters = system
             total_iters = 1000
             max_step = self.max_step  # 20
             min_step = self.min_step  # 980
@@ -103,9 +102,9 @@ class StableDiffusion(nn.Module):
             noise = torch.randn_like(latents)
             latents_noisy = self.scheduler.add_noise(latents, noise, t)
             latent_model_input = torch.cat([latents_noisy] * 2)
-            bs = len(latent_model_input)
             class_labels = None
             noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings, class_labels=class_labels).sample
+            print(len(noise_pred))
 
         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
         noise_pred = noise_pred_text + guidance_scale * (noise_pred_text - noise_pred_uncond)

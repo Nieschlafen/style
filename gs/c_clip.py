@@ -9,7 +9,7 @@ class CLIP(nn.Module):
         self.device = device
         # clip.load("ViT-B/32", device=device) /mnt/dolphinfs/hdd_pool/docker/user/hadoop-mtcv/herunze/.cache/clip/ViT-B/32
         self.model, self.preprocess = clip.load("ViT-B/32", device=device)
-        self.model.cuda().eval()
+        self.model.cuda().train()
         self.transformCLIP = T.Compose([
             T.Resize(size=224, interpolation= T.InterpolationMode.BICUBIC, max_size=None, antialias=None),
             T.CenterCrop(size=(224,224)),

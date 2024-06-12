@@ -7,6 +7,7 @@ from gs.c_clip import CLIP
 import clip
 
 from diffusers import DiffusionPipeline, StableDiffusionPipeline
+from diffusers import DDIMScheduler, StableDiffusionInstructPix2PixPipeline
 from threestudio.utils.base import BaseObject
 from threestudio.utils.typing import *
 from threestudio.utils.misc import C, parse_version
@@ -17,6 +18,8 @@ class CustomStyleGuidance(BaseObject):
     @dataclass
     class Config(BaseObject.Config):
         cache_dir: Optional[str] = None
+        ddim_scheduler_name_or_path: str = "CompVis/stable-diffusion-v1-4"
+        ip2p_name_or_path: str = "timbrooks/instruct-pix2pix"
         control_type: str = "normal"
 
         enable_memory_efficient_attention: bool = False
@@ -51,8 +54,8 @@ class CustomStyleGuidance(BaseObject):
 
         # model_key = "/home/llq/Data/model_weight/runwayml/stable-diffusion-v1-5"
         model_key = "runwayml/stable-diffusion-v1-5"
-        print(f"load model: {model_key}")
         self.pipe = DiffusionPipeline.from_pretrained(model_key).to(self.device)
+        print(f"load model: {model_key}")
 
         self.vae = self.pipe.vae
         self.tokenizer = self.pipe.tokenizer
@@ -94,8 +97,23 @@ class CustomStyleGuidance(BaseObject):
         t: Float[Tensor, "..."],
         encoder_hidden_states: Float[Tensor, "..."],
     ) -> Float[Tensor, "..."]:
+        input_dtype = latents.dtype
         class_labels = None
-        return self.unet(latents, t, encoder_hidden_states=encoder_hidden_states, class_labels=class_labels).sample
+        return self.unet(latents.to(self.weights_dtype),
+                         t.to(self.weights_dtype),
+                         encoder_hidden_states=encoder_hidden_states.to(self.weights_dtype),
+                         class_labels=class_labels,
+                         ).sample.to(input_dtype)
+
+    @torch.cuda.amp.autocast(enabled=False)
+    def forward_unet2(
+        self,
+        latents: Float[Tensor, "..."],
+        t: Float[Tensor, "..."],
+        encoder_hidden_states: Float[Tensor, "..."],
+    ) -> Float[Tensor, "..."]:
+        class_labels = None
+        return self.unet(latents, t, encoder_hidden_states=encoder_hidden_states,class_labels=class_labels).sample
 
     @torch.cuda.amp.autocast(enabled=False)
     def encode_images(
@@ -113,7 +131,7 @@ class CustomStyleGuidance(BaseObject):
     ) -> Float[Tensor, "B 4 DH DW"]:
         input_dtype = imgs.dtype
         imgs = imgs * 2.0 - 1.0
-        posterior = self.vae.encode(imgs).latent_dist
+        posterior = self.vae.encode(imgs.to(self.weights_dtype)).latent_dist
         latents = posterior.mode()
         uncond_image_latents = torch.zeros_like(latents)
         latents = torch.cat([latents, latents, uncond_image_latents], dim=0)
@@ -163,15 +181,15 @@ class CustomStyleGuidance(BaseObject):
         # t = max(int((1 - cur_iters / total_iters) * max_step), min_step)
         # t = torch.tensor([t], dtype=torch.long, device=self.device)
         t = torch.randint(min_step, max_step + 1, [1], dtype=torch.long, device=self.device)
-
         t = (t * t_ratio).to(torch.long)
+
         with torch.no_grad():
             # add noise
             noise = torch.randn_like(latents)
             latents_noisy = self.scheduler.add_noise(latents, noise, t)
             # pred noise
             latent_model_input = torch.cat([latents_noisy] * 2)
-            noise_pred = self.forward_unet(latent_model_input, t, encoder_hidden_states=text_embeddings)
+            noise_pred = self.forward_unet2(latent_model_input, t, encoder_hidden_states=text_embeddings)
 
         noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
         noise_pred = noise_pred_text + guidance_scale * (noise_pred_uncond - noise_pred_text)
@@ -212,15 +230,16 @@ class CustomStyleGuidance(BaseObject):
         t_ratio = 1
         """temp = torch.zeros(1).to(rgb.device)
         text_embeddings = prompt_guidance.get_text_embeddings(temp, temp, temp, False)"""
-        match_probs = None
+
+        """match_probs = None
         with torch.no_grad():
             images = self.clip_guidance.transformCLIP(pred_rgb)
             logits_per_image, logits_per_text = self.clip_guidance.model(images, self.clip_match_text)
             match_probs = logits_per_image.softmax(dim=1)
         select = match_probs.max(-1).indices.tolist()
-        # text_z = torch.cat([self.text_z[t].clone() for t in select])
-        text_z = self.text_z
+        text_z = torch.cat([self.text_z[t].clone() for t in select])"""
 
+        text_z = self.text_z
         loss_dict = {}
         loss_sd, loss_dict_sd = self.train_step(latents, text_z, global_step, t_ratio=t_ratio)
         loss = loss_sd

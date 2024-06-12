@@ -17,6 +17,7 @@ from tqdm import tqdm
 from scene import Scene, GaussianModel
 from gs.sd import StableDiffusion
 from gs.c_clip import CLIP
+from torchvision.transforms.functional import to_pil_image
 import torch.optim as optim
 import numpy as np
 try:
@@ -38,11 +39,11 @@ def initialize_CLIP(device):
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, ply_path, debug_from,
              input_text=None):
-    global text_z, clip_match_text
     device = "cuda"
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree)
+    gaussians.training_setup(opt)
     # load the rgb reconstructed gaussians ply file
     scene = Scene(dataset, gaussians, load_path=ply_path)
 
@@ -56,38 +57,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     ema_loss_for_log = 0.0
     guidance = initialize_guidance(device, opt)
     clip_guidance = initialize_CLIP(device)
-
     if input_text is None:
         print(f"[WARN] text prompt is not provided.")
         text_z = None
 
-        if opt.clip_view:
-            text_z = []
-            for d in ['front', 'side', 'back']:  # , 'side', 'overhead', 'bottom']:
-                # construct dir-encoded text
-                text = f"{input_text}, {d} view"
-                text_z_i = guidance.get_text_embeds([text], [opt.negative])
-                text_z.append(text_z_i)
-        else:
-            assert False
-
-            # prompt = ["a bear statue's front view in a forest", "a bear statue's back view in a forest"]
-            # prompt = ["front view of an object", "side view of an object", 'back view of an object']
-        prompt = ["front face of an object", "side face of an object", 'back face of an object']
-        clip_match_text = clip.tokenize(prompt).to(device)  # torch.Size([3, 77])
-        clip_trans = T.Compose(
-            [
-                T.Resize((224,224)),
-                T.Normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
-            ]
-        )
+    if opt.clip_view:
+        text_z = []
+        for d in ['front', 'side', 'back']:  # , 'side', 'overhead', 'bottom']:
+            # construct dir-encoded text
+            text = f"{input_text}, {d} view"
+            text_z_i = guidance.get_text_embeds([text], [opt.negative])
+            text_z.append(text_z_i)
+    else:
+        assert False
+        # prompt = ["a bear statue's front view in a forest", "a bear statue's back view in a forest"]
+        # prompt = ["front view of an object", "side view of an object", 'back view of an object']
+    prompt = ["front face of an object", "side face of an object", 'back face of an object']
+    clip_match_text = clip.tokenize(prompt).to(device)  # torch.Size([3, 77])
+    clip_trans = T.Compose(
+        [
+            T.Resize((224,224)),
+            T.Normalize([0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]),
+        ]
+    )
+    global_step = 0
 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):
         iter_start.record()
         gaussians.update_learning_rate(iteration)
-
+        global_step += 1
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
@@ -107,18 +107,22 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         # image 为渲染出原图像 pred_rgb
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"],render_pkg["visibility_filter"], render_pkg["radii"]
 
-        pred_rgb_512 = F.interpolate(image, (512, 512), mode='bilinear', align_corners=False)
+        image_tensor = image.unsqueeze(0)
+
+        pred_rgb_512 = F.interpolate(image_tensor, (512, 512), mode='bilinear', align_corners=False)
         latents = guidance.encode_imgs(pred_rgb_512)
+        print("iteration:"+str(iteration))
+        print(len(latents))
         match_probs = None
         with torch.no_grad():
-            text_images = clip_guidance.transformCLIP(image)
+            text_images = clip_guidance.transformCLIP(image_tensor)
             logits_per_image, logits_per_text = clip_guidance.model(text_images, clip_match_text)
             match_probs = logits_per_image.softmax(dim=1)
         select = match_probs.max(-1).indices.tolist()
         text_z = torch.cat([text_z[t].clone() for t in select])
         text_emb = text_z
         loss_dict = {}
-        loss_sd, loss_dict = guidance.train_step(latents, text_emb,system=None, t_ratio=1)
+        loss_sd, loss_dict = guidance.train_step(latents, text_emb,system=global_step, t_ratio=1)
         loss = loss_sd
         loss_dict.update(loss_dict)
         loss.backward()
@@ -146,21 +150,6 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
-
-            # Densification
-            if iteration < opt.densify_until_iter:
-                # Keep track of max radii in image-space for pruning
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter],
-                                                                     radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
-
-                if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
-                    size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold)
-
-                if iteration % opt.opacity_reset_interval == 0 or (
-                        dataset.white_background and iteration == opt.densify_from_iter):
-                    gaussians.reset_opacity()
 
             # Optimizer step
             if iteration < opt.iterations:
