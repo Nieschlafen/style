@@ -12,17 +12,14 @@ from diffusers.utils.import_utils import is_xformers_available
 from diffusers.pipelines.controlnet import MultiControlNetModel
 from diffusers.utils.torch_utils import is_compiled_module, is_torch_version, randn_tensor
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.utils.import_utils import is_invisible_watermark_available
-
+from diffusers.models import AutoencoderKL
 
 from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
 
 import threestudio
-from threestudio.models.prompt_processors.base import PromptProcessorOutput
 from threestudio.utils.base import BaseObject
 from threestudio.utils.misc import C, parse_version
 from threestudio.utils.typing import *
-from ip_adapter import IPAdapterXL
 from PIL import Image
 from safetensors import safe_open
 from diffusers.models.attention_processor import (
@@ -33,6 +30,7 @@ from diffusers.models.attention_processor import (
 )
 
 from ip_adapter.utils import is_torch2_available, get_generator
+
 if is_torch2_available():
     from ip_adapter.attention_processor import (
         AttnProcessor2_0 as AttnProcessor,
@@ -67,6 +65,7 @@ class ImageProjModel(torch.nn.Module):
         clip_extra_context_tokens = self.norm(clip_extra_context_tokens)
         return clip_extra_context_tokens
 
+
 @threestudio.register("stable-diffusion-newinstantstyle-guidance")
 class newInstantStyleGuidance(BaseObject):
     @dataclass
@@ -75,15 +74,16 @@ class newInstantStyleGuidance(BaseObject):
 
         ddim_scheduler_name_or_path: str = "runwayml/stable-diffusion-v1-5"
         base_model_path: str = "stabilityai/stable-diffusion-xl-base-1.0"
-        image_encoder_path: str = "/home/yjx/desktop/InstantStyle/sdxl_models/image_encoder"
-        ip_ckpt: str = "/home/yjx/desktop/InstantStyle/sdxl_models/ip-adapter_sdxl.bin"
+        # image_encoder_path: str = "/home/yjx/desktop/InstantStyle/sdxl_models/image_encoder"
+        image_encoder_path: str = "/home/lk/desktop/style/sdxl_models/image_encoder"
+        # ip_ckpt: str = "/home/yjx/desktop/InstantStyle/sdxl_models/ip-adapter_sdxl.bin"
+        ip_ckpt: str = "/home/lk/desktop/style/sdxl_models/ip-adapter_sdxl.bin"
         control_type: str = "normal"
 
         enable_memory_efficient_attention: bool = False
         enable_sequential_cpu_offload: bool = False
         enable_attention_slicing: bool = False
         enable_channels_last_format: bool = False
-        guidance_scale: float = 7.5
         condition_scale: float = 1.5
         grad_clip: Optional[
             Any
@@ -93,6 +93,7 @@ class newInstantStyleGuidance(BaseObject):
         min_step_percent: float = 0.02
         max_step_percent: float = 0.98
 
+        lambda_sd: float = 0.01
         diffusion_steps: int = 30
         seed: int = 42
         use_sds: bool = False
@@ -102,18 +103,20 @@ class newInstantStyleGuidance(BaseObject):
     def configure(self) -> None:
         threestudio.info(f"Loading new instantstyle ...")
 
-        self.weights_dtype = (torch.float16 if self.cfg.half_precision_weights else torch.float32)
+        self.weights_dtype = torch.float16
 
-        pipe_kwargs = {"cache_dir": self.cfg.cache_dir,}
+        pipe_kwargs = {"cache_dir": self.cfg.cache_dir, }
         controlnet_path = "diffusers/controlnet-canny-sdxl-1.0"
         controlnet = ControlNetModel.from_pretrained(controlnet_path, use_safetensors=False,
                                                      torch_dtype=self.weights_dtype).to(self.device)
+        vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae")
         self.pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
             self.cfg.base_model_path,
             controlnet=controlnet,
+            vae=vae,
             torch_dtype=self.weights_dtype,
             add_watermarker=False,
-            ** pipe_kwargs,
+            **pipe_kwargs,
         ).to(self.device)
         self.target_blocks = ["up_blocks.0.attentions.1"]
         self.num_tokens = 4
@@ -248,15 +251,15 @@ class newInstantStyleGuidance(BaseObject):
 
     @torch.cuda.amp.autocast(enabled=False)
     def forward_controlnet(
-        self,
-        control_model_input,
-        t,
-        encoder_hidden_states,
-        controlnet_cond,
-        conditioning_scale,
-        guess_mode,
-        added_cond_kwargs,
-        return_dict,
+            self,
+            control_model_input,
+            t,
+            encoder_hidden_states,
+            controlnet_cond,
+            conditioning_scale,
+            guess_mode,
+            added_cond_kwargs,
+            return_dict,
     ) -> Float[Tensor, "..."]:
         return self.controlnet(
             control_model_input.to(self.weights_dtype),
@@ -271,20 +274,20 @@ class newInstantStyleGuidance(BaseObject):
 
     @torch.cuda.amp.autocast(enabled=False)
     def forward_unet(
-        self,
-        latents_model_input,
-        t,
-        encoder_hidden_states,
-        timestep_cond,
-        cross_attention_kwargs,
-        down_block_additional_residuals,
-        mid_block_additional_residual,
-        added_cond_kwargs,
-        return_dict,
+            self,
+            latents_model_input,
+            t,
+            encoder_hidden_states,
+            timestep_cond,
+            cross_attention_kwargs,
+            down_block_additional_residuals,
+            mid_block_additional_residual,
+            added_cond_kwargs,
+            return_dict,
     ) -> Float[Tensor, "..."]:
         return self.unet(
             latents_model_input.to(self.weights_dtype),
-            t.to(self.weights_dtype),
+            t,
             encoder_hidden_states=encoder_hidden_states.to(self.weights_dtype),
             timestep_cond=timestep_cond,
             cross_attention_kwargs=cross_attention_kwargs,
@@ -296,12 +299,12 @@ class newInstantStyleGuidance(BaseObject):
 
     @torch.cuda.amp.autocast(enabled=False)
     def encode_images(
-        self, imgs: Float[Tensor, "B 3 H W"]
+            self, imgs: Float[Tensor, "B 3 H W"]
     ) -> Float[Tensor, "B 4 DH DW"]:
         input_dtype = imgs.dtype
         imgs = imgs * 2.0 - 1.0
-        posterior = self.vae.encode(imgs.to(self.weights_dtype)).latent_dist
-        latents = posterior.sample() * self.vae.config.scaling_factor
+        posterior = self.vae.encode(imgs).latent_dist
+        latents = posterior.sample() * 0.18215
         return latents.to(input_dtype)
 
     def set_scale(self, scale):
@@ -346,16 +349,16 @@ class newInstantStyleGuidance(BaseObject):
 
     # Copied from diffusers.pipelines.controlnet.pipeline_controlnet.StableDiffusionControlNetPipeline.prepare_image
     def prepare_image(
-        self,
-        image,
-        width,
-        height,
-        batch_size,
-        num_images_per_prompt,
-        device,
-        dtype,
-        do_classifier_free_guidance=False,
-        guess_mode=False,
+            self,
+            image,
+            width,
+            height,
+            batch_size,
+            num_images_per_prompt,
+            device,
+            dtype,
+            do_classifier_free_guidance=False,
+            guess_mode=False,
     ):
         image = self.control_image_processor.preprocess(image, height=height, width=width).to(dtype=torch.float32)
         image_batch_size = image.shape[0]
@@ -409,15 +412,15 @@ class newInstantStyleGuidance(BaseObject):
         return emb
 
     def prepare_prompt_embed(
-        self,
-        pil_image,  # 风格图
-        prompt=None,
-        negative_prompt=None,
-        scale=1.0,
-        num_samples=4,
-        seed=42,
-        num_inference_steps=30,
-        **kwargs,
+            self,
+            style_image,  # 风格图
+            prompt=None,
+            negative_prompt=None,
+            scale=1.0,
+            num_samples=4,
+            seed=42,
+            num_inference_steps=30,
+            **kwargs,
     ):
         self.set_scale(scale)
         num_prompts = 1
@@ -432,7 +435,8 @@ class newInstantStyleGuidance(BaseObject):
             negative_prompt = [negative_prompt] * num_prompts
 
         pooled_prompt_embeds_ = None
-        image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(pil_image, content_prompt_embeds=pooled_prompt_embeds_)
+        image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(style_image,
+                                                                                content_prompt_embeds=pooled_prompt_embeds_)
         bs_embed, seq_len, _ = image_prompt_embeds.shape
         image_prompt_embeds = image_prompt_embeds.repeat(1, num_samples, 1)
         image_prompt_embeds = image_prompt_embeds.view(bs_embed * num_samples, seq_len, -1)
@@ -458,12 +462,12 @@ class newInstantStyleGuidance(BaseObject):
 
     # Copied from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl.StableDiffusionXLPipeline._get_add_time_ids
     def _get_add_time_ids(
-        self, original_size, crops_coords_top_left, target_size, dtype, text_encoder_projection_dim=None
+            self, original_size, crops_coords_top_left, target_size, dtype, text_encoder_projection_dim=None
     ):
         add_time_ids = list(original_size + crops_coords_top_left + target_size)
 
         passed_add_embed_dim = (
-            self.unet.config.addition_time_embed_dim * len(add_time_ids) + text_encoder_projection_dim
+                self.unet.config.addition_time_embed_dim * len(add_time_ids) + text_encoder_projection_dim
         )
         expected_add_embed_dim = self.unet.add_embedding.linear_1.in_features
 
@@ -495,17 +499,15 @@ class newInstantStyleGuidance(BaseObject):
             self.vae.decoder.conv_in.to(dtype)
             self.vae.decoder.mid_block.to(dtype)
 
-    @torch.no_grad()
     def __call__(
             self,
             rgb: Float[Tensor, "B H W C"],
             global_step,
-            cond_rgb: Float[Tensor, "B H W C"],
+            canny_map,
             **kwargs,
     ):
         batch_size, H, W, _ = rgb.shape
         assert batch_size == 1
-
         height: Optional[int] = None
         width: Optional[int] = None
         num_images_per_prompt: Optional[int] = 1
@@ -518,28 +520,26 @@ class newInstantStyleGuidance(BaseObject):
         control_guidance_start: Union[float, List[float]] = 0.0
         control_guidance_end: Union[float, List[float]] = 1.0
         cross_attention_kwargs: Optional[Dict[str, Any]] = None
-        latents: Optional[torch.FloatTensor] = None
 
-        pred_rgb = rgb.permute(0, 3, 1, 2).contiguous() # [1, 3, H, W]
+        pred_rgb = rgb.permute(0, 3, 1, 2).contiguous()  # [1, 3, H, W]
         img_rgb = pred_rgb
         pred_rgb_512 = F.interpolate(img_rgb, (512, 512), mode='bilinear', align_corners=False)
         latents = self.encode_images(pred_rgb_512)
 
-        # style image
-        image = "/home/yjx/desktop/style/assets/4.jpg"
-        image = Image.open(image)
-        image.resize((512, 512))
-
-        cond_rgb_numpy = rgb.cpu().detach().numpy()
+        """cond_rgb_numpy = rgb.cpu().detach().numpy()
         cond_rgb_numpy = (cond_rgb_numpy * 255).astype(np.uint8)
-        cv2.imwrite('cond_rgb_image.jpg', cv2.cvtColor(cond_rgb_numpy[0], cv2.COLOR_RGB2BGR))
+        # cv2.imwrite(f'cond_rgb_image_{view_index}.jpg', cv2.cvtColor(cond_rgb_numpy[0], cv2.COLOR_RGB2BGR))
         retval, buffer = cv2.imencode('.jpg', cond_rgb_numpy[0])
         rbimage = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
 
         detected_map = cv2.Canny(rbimage, 50, 200)
-        canny_map = Image.fromarray(cv2.cvtColor(detected_map, cv2.COLOR_BGR2RGB))
-        output_path2 = "canny_output.png"
-        canny_map.save(output_path2)
+        canny_map = Image.fromarray(cv2.cvtColor(detected_map, cv2.COLOR_BGR2RGB))"""
+
+        # style image
+        image = "/home/lk/desktop/style/assets/4.jpg"
+        image = Image.open(image)
+        image.resize((512, 512))
+
         controlnet = self.controlnet._orig_mod if is_compiled_module(self.controlnet) else self.controlnet
         # align format for control guidance
         if not isinstance(control_guidance_start, list) and isinstance(control_guidance_end, list):
@@ -561,7 +561,7 @@ class newInstantStyleGuidance(BaseObject):
             pooled_prompt_embeds,
             negative_pooled_prompt_embeds,
         ) = self.prepare_prompt_embed(
-            pil_image=image,
+            style_image=image,
             prompt="best quality, high quality",
             negative_prompt="text, watermark, lowres, low quality, worst quality, deformed, glitch, low contrast, noisy, saturation, blurry",
             scale=1.0,
@@ -589,16 +589,7 @@ class newInstantStyleGuidance(BaseObject):
         # 6. Prepare latent variables
         generator = get_generator(self.cfg.seed, self.device)
         num_channels_latents = self.unet.config.in_channels
-        """latents = self.prepare_latents(
-            batch_size * num_images_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            prompt_embeds.dtype,
-            self.device,
-            generator,
-            latents,
-        )"""
+
         # 6.5 Optionally get Guidance Scale Embedding
         timestep_cond = None
         if self.unet.config.time_cond_proj_dim is not None:
@@ -606,7 +597,7 @@ class newInstantStyleGuidance(BaseObject):
             timestep_cond = self.get_guidance_scale_embedding(
                 guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
             ).to(device=self.device, dtype=latents.dtype)
-        # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
+        # 7. Prepare extra step kwargs.
         eta: float = 0.0
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
         # 7.1 Create tensor stating which controlnets to keep
@@ -660,6 +651,7 @@ class newInstantStyleGuidance(BaseObject):
 
         if (is_unet_compiled and is_controlnet_compiled) and is_torch_higher_equal_2_1:
             torch._inductor.cudagraph_mark_step_begin()
+
         with torch.no_grad():
             noise = torch.randn_like(latents)  # 1 4 64 64
             latents_noisy = self.scheduler.add_noise(latents, noise, t)
@@ -700,7 +692,7 @@ class newInstantStyleGuidance(BaseObject):
         noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)  # 1 4 64 64
 
         w = (1 - self.alphas[t])
-        grad = w * (noise_pred - noise)
+        grad = w * (noise_pred - noise) * self.lambda_sd
         grad = torch.nan_to_num(grad)
 
         target = (latents - grad).detach()

@@ -1,3 +1,4 @@
+import sys
 from dataclasses import dataclass
 
 import cv2
@@ -7,7 +8,6 @@ import torch.nn.functional as F
 from diffusers import DDIMScheduler
 from diffusers import ControlNetModel, StableDiffusionXLControlNetPipeline
 from diffusers.utils.import_utils import is_xformers_available
-
 import threestudio
 from threestudio.models.prompt_processors.base import PromptProcessorOutput
 from threestudio.utils.base import BaseObject
@@ -15,6 +15,7 @@ from threestudio.utils.misc import C, parse_version
 from threestudio.utils.typing import *
 from ip_adapter import IPAdapterXL
 from PIL import Image
+import torchvision.transforms as transforms
 
 
 @threestudio.register("stable-diffusion-instantstyle-guidance")
@@ -25,8 +26,8 @@ class InstantStyleGuidance(BaseObject):
 
         ddim_scheduler_name_or_path: str = "CompVis/stable-diffusion-v1-4"
         base_model_path: str = "stabilityai/stable-diffusion-xl-base-1.0"
-        image_encoder_path: str = "/data_heat/jcx/InstantStyle/sdxl_models/image_encoder"
-        ip_ckpt: str = "/data_heat/jcx/InstantStyle/sdxl_models/ip-adapter_sdxl.bin"
+        image_encoder_path: str = "/home/lk/desktop/style/sdxl_models/image_encoder"
+        ip_ckpt: str = "/home/lk/desktop/style/sdxl_models/ip-adapter_sdxl.bin"
         control_type: str = "normal"
 
         enable_memory_efficient_attention: bool = False
@@ -69,7 +70,7 @@ class InstantStyleGuidance(BaseObject):
             controlnet=controlnet,
             torch_dtype=self.weights_dtype,
             add_watermarker=False,
-            ** pipe_kwargs,
+            **pipe_kwargs,
         ).to(self.device)
 
         self.scheduler = DDIMScheduler.from_pretrained(
@@ -118,7 +119,8 @@ class InstantStyleGuidance(BaseObject):
         self.alphas: Float[Tensor, "..."] = self.scheduler.alphas_cumprod.to(
             self.device
         )
-
+        self.ip_model = IPAdapterXL(self.pipe, self.cfg.image_encoder_path, self.cfg.ip_ckpt, self.device,
+                                    target_blocks=["up_blocks.0.attentions.1"])
         self.grad_clip_val: Optional[float] = None
 
         threestudio.info(f"finish_Loaded instantstyle!")
@@ -130,10 +132,10 @@ class InstantStyleGuidance(BaseObject):
 
     @torch.cuda.amp.autocast(enabled=False)
     def forward_unet(
-        self,
-        latents: Float[Tensor, "..."],
-        t: Float[Tensor, "..."],
-        encoder_hidden_states: Float[Tensor, "..."],
+            self,
+            latents: Float[Tensor, "..."],
+            t: Float[Tensor, "..."],
+            encoder_hidden_states: Float[Tensor, "..."],
     ) -> Float[Tensor, "..."]:
         input_dtype = latents.dtype
         return self.unet(
@@ -144,7 +146,7 @@ class InstantStyleGuidance(BaseObject):
 
     @torch.cuda.amp.autocast(enabled=False)
     def encode_images(
-        self, imgs: Float[Tensor, "B 3 H W"]
+            self, imgs: Float[Tensor, "B 3 H W"]
     ) -> Float[Tensor, "B 4 DH DW"]:
         input_dtype = imgs.dtype
         imgs = imgs * 2.0 - 1.0
@@ -154,7 +156,7 @@ class InstantStyleGuidance(BaseObject):
 
     @torch.cuda.amp.autocast(enabled=False)
     def encode_cond_images(
-        self, imgs: Float[Tensor, "B 3 H W"]
+            self, imgs: Float[Tensor, "B 3 H W"]
     ) -> Float[Tensor, "B 4 DH DW"]:
         input_dtype = imgs.dtype
         imgs = imgs * 2.0 - 1.0
@@ -166,7 +168,7 @@ class InstantStyleGuidance(BaseObject):
 
     @torch.cuda.amp.autocast(enabled=False)
     def decode_latents(
-        self, latents: Float[Tensor, "B 4 DH DW"]
+            self, latents: Float[Tensor, "B 4 DH DW"]
     ) -> Float[Tensor, "B 3 H W"]:
         input_dtype = latents.dtype
         latents = 1 / self.vae.config.scaling_factor * latents
@@ -174,187 +176,49 @@ class InstantStyleGuidance(BaseObject):
         image = (image * 0.5 + 0.5).clamp(0, 1)
         return image.to(input_dtype)
 
-    def edit_latents(
-        self,
-        text_embeddings: Float[Tensor, "BB 77 768"],
-        latents: Float[Tensor, "B 4 DH DW"],
-        image_cond_latents: Float[Tensor, "B 4 DH DW"],
-        t: Int[Tensor, "B"],
-    ) -> Float[Tensor, "B 4 DH DW"]:
-        self.scheduler.config.num_train_timesteps = t.item()
-        self.scheduler.set_timesteps(self.cfg.diffusion_steps)
-        with torch.no_grad():
-            # add noise
-            noise = torch.randn_like(latents)
-            latents = self.scheduler.add_noise(latents, noise, t)  # type: ignore
-            threestudio.debug("Start editing...")
-            # sections of code used from https://github.com/huggingface/diffusers/blob/main/src/diffusers/pipelines/stable_diffusion/pipeline_stable_diffusion_instruct_pix2pix.py
-            for i, t in enumerate(self.scheduler.timesteps):
-                # predict the noise residual with unet, NO grad!
-                with torch.no_grad():
-                    # pred noise
-                    latent_model_input = torch.cat([latents] * 3)
-                    latent_model_input = torch.cat(
-                        [latent_model_input, image_cond_latents], dim=1
-                    )
-
-                    noise_pred = self.forward_unet(
-                        latent_model_input, t, encoder_hidden_states=text_embeddings
-                    )
-
-                # perform classifier-free guidance
-                noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(
-                    3
-                )
-                noise_pred = (
-                    noise_pred_uncond
-                    + self.cfg.guidance_scale * (noise_pred_text - noise_pred_image)
-                    + self.cfg.condition_scale * (noise_pred_image - noise_pred_uncond)
-                )
-
-                # get previous sample, continue loop
-                latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-            threestudio.debug("Editing finished.")
-        return latents
-
-    def compute_grad_sds(
-        self,
-        text_embeddings: Float[Tensor, "BB 77 768"],
-        latents: Float[Tensor, "B 4 DH DW"],
-        image_cond_latents: Float[Tensor, "B 4 DH DW"],
-        t: Int[Tensor, "B"],
-    ):
-        with torch.no_grad():
-            # add noise
-            noise = torch.randn_like(latents)  # TODO: use torch generator
-            latents_noisy = self.scheduler.add_noise(latents, noise, t)
-            # pred noise
-            latent_model_input = torch.cat([latents_noisy] * 3)
-            latent_model_input = torch.cat(
-                [latent_model_input, image_cond_latents], dim=1
-            )
-
-            noise_pred = self.forward_unet(
-                latent_model_input, t, encoder_hidden_states=text_embeddings
-            )
-
-        noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
-        noise_pred = (
-            noise_pred_uncond
-            + self.cfg.guidance_scale * (noise_pred_text - noise_pred_image)
-            + self.cfg.condition_scale * (noise_pred_image - noise_pred_uncond)
-        )
-
-        w = (1 - self.alphas[t]).view(-1, 1, 1, 1)
-        grad = w * (noise_pred - noise)
-        return grad
-
     def __call__(
             self,
             rgb: Float[Tensor, "B H W C"],
-            cond_rgb: Float[Tensor, "B H W C"],
-            prompt_utils: PromptProcessorOutput,
+            view_index,
+            canny_map,
             **kwargs,
     ):
         batch_size, H, W, _ = rgb.shape
         assert batch_size == 1
-        assert rgb.shape[:-1] == cond_rgb.shape[:-1]
 
-        ip_model = IPAdapterXL(self.pipe, self.cfg.image_encoder_path, self.cfg.ip_ckpt, self.device, target_blocks=["up_blocks.0.attentions.1"])
         # style image
-        image = "./assets/4.jpg"
+        image = "./assets/14.jpg"
         image = Image.open(image)
         image.resize((512, 512))
 
-        cond_rgb_numpy = cond_rgb.cpu().numpy()
+        """cond_rgb_numpy = cond_rgb.cpu().numpy()
         cond_rgb_numpy = (cond_rgb_numpy * 255).astype(np.uint8)
-        cv2.imwrite('cond_rgb_image.jpg', cv2.cvtColor(cond_rgb_numpy[0], cv2.COLOR_RGB2BGR))
         retval, buffer = cv2.imencode('.jpg', cond_rgb_numpy[0])
         rbimage = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
 
         detected_map = cv2.Canny(rbimage, 50, 200)
-        canny_map = Image.fromarray(cv2.cvtColor(detected_map, cv2.COLOR_BGR2RGB))
-        output_path2 = "canny_output.png"
-        canny_map.save(output_path2)
-
+        canny_map = Image.fromarray(cv2.cvtColor(detected_map, cv2.COLOR_BGR2RGB))"""
         # generate image
-        images = ip_model.generate(pil_image=image,
-                                   prompt="best quality, high quality",
-                                   negative_prompt="text, watermark, lowres, low quality, worst quality, deformed, glitch, low contrast, noisy, saturation, blurry",
-                                   scale=1.0,
-                                   guidance_scale=5,
-                                   num_samples=1,
-                                   num_inference_steps=30,
-                                   seed=42,
-                                   image=canny_map,
-                                   controlnet_conditioning_scale=0.6,
-                                   )
-        images[0].save("result.png")
-        image_array = np.array(images[0])
-        image_tensor = torch.tensor(image_array, dtype=self.weights_dtype)
-        image_tensor = image_tensor.unsqueeze(0)
+        images = self.ip_model.generate(pil_image=image,
+                                        prompt="best quality, high quality",
+                                        negative_prompt="text, watermark, lowres, low quality, worst quality, deformed, glitch, low contrast, noisy, saturation, blurry",
+                                        scale=1.0,
+                                        guidance_scale=5,
+                                        num_samples=1,
+                                        num_inference_steps=20,
+                                        seed=42,
+                                        image=canny_map,
+                                        controlnet_conditioning_scale=0.6,
+                                        )
+        images[0].save(f"./renderings/result_{view_index}.png")
+        image = images[0]
+        transform = transforms.Compose([
+            transforms.Resize((512, 512)),  # 调整图像大小为 512x512
+            transforms.ToTensor(),  # 转换为 PyTorch 张量并归一化到 [0, 1] 之间
+        ])
+        image_tensor = transform(image)
+        image_tensor = image_tensor.unsqueeze(0)  # [1, 3, 512, 512]
+        image_tensor = image_tensor.permute(0, 2, 3, 1)
+        image_tensor = image_tensor.to(self.device)
 
-        rgb_BCHW = rgb.permute(0, 3, 1, 2)
-        latents: Float[Tensor, "B 4 DH DW"]
-        if self.cfg.fixed_size > 0:
-            RH, RW = self.cfg.fixed_size, self.cfg.fixed_size
-        else:
-            RH, RW = H // 8 * 8, W // 8 * 8
-        rgb_BCHW_HW8 = F.interpolate(
-            rgb_BCHW, (RH, RW), mode="bilinear", align_corners=False
-        )
-        print(f"rgb_BCHW_HW8 device before encoding: {rgb_BCHW_HW8.device}")
-        latents = self.encode_images(rgb_BCHW_HW8)
-
-        image_cond = image_tensor.permute(0, 3, 1, 2)
-        image_cond = image_cond.to(torch.float32)
-        image_cond = F.interpolate(
-            image_cond, (RH, RW), mode="bilinear", align_corners=False
-        )
-        image_cond.to(rgb_BCHW_HW8.device)
-        print(f"image_cond device before encoding: {image_cond.device}")
-        cond_latents = self.encode_cond_images(image_cond)
-
-        temp = torch.zeros(1).to(rgb.device)
-        text_embeddings = prompt_utils.get_text_embeddings(temp, temp, temp, False)
-
-        # timestep ~ U(0.02, 0.98) to avoid very high/low noise level
-        t = torch.randint(
-            self.min_step,
-            self.max_step + 1,
-            [batch_size],
-            dtype=torch.long,
-            device=self.device,
-        )
-
-        if self.cfg.use_sds:
-            grad = self.compute_grad_sds(text_embeddings, latents, cond_latents, t)
-            grad = torch.nan_to_num(grad)
-            if self.grad_clip_val is not None:
-                grad = grad.clamp(-self.grad_clip_val, self.grad_clip_val)
-            target = (latents - grad).detach()
-            loss_sds = 0.5 * F.mse_loss(latents, target, reduction="sum") / batch_size
-            return {
-                "loss_sds": loss_sds,
-                "grad_norm": grad.norm(),
-                "min_step": self.min_step,
-                "max_step": self.max_step,
-            }
-        else:
-            edit_latents = self.edit_latents(text_embeddings, latents, cond_latents, t)
-            edit_images = self.decode_latents(edit_latents)
-            edit_images = F.interpolate(edit_images, (H, W), mode="bilinear")
-
-            return {"edit_images": edit_images.permute(0, 2, 3, 1)}
-
-    def update_step(self, epoch: int, global_step: int, on_load_weights: bool = False):
-        # clip grad for stable training as demonstrated in
-        # Debiasing Scores and Prompts of 2D Diffusion for Robust Text-to-3D Generation
-        # http://arxiv.org/abs/2303.15413
-        if self.cfg.grad_clip is not None:
-            self.grad_clip_val = C(self.cfg.grad_clip, epoch, global_step)
-
-        self.set_min_max_steps(
-            min_step_percent=C(self.cfg.min_step_percent, epoch, global_step),
-            max_step_percent=C(self.cfg.max_step_percent, epoch, global_step),
-        )
+        return {"edit_images": image_tensor}

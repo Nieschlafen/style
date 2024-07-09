@@ -340,40 +340,15 @@ class GaussianModel:
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
 
         l = [
-            {
-                "params": [self._xyz],
-                "lr": training_args.position_lr_init * self.spatial_lr_scale,
-                "name": "xyz",
-            },
-            {
-                "params": [self._features_dc],
-                "lr": training_args.feature_lr,
-                "name": "f_dc",
-            },
-            {
-                "params": [self._features_rest],
-                "lr": training_args.feature_lr / 20.0,
-                "name": "f_rest",
-            },
-            {
-                "params": [self._opacity],
-                "lr": training_args.opacity_lr,
-                "name": "opacity",
-            },
-            {
-                "params": [self._scaling],
-                "lr": training_args.scaling_lr,
-                "name": "scaling",
-            },
-            {
-                "params": [self._rotation],
-                "lr": training_args.rotation_lr,
-                "name": "rotation",
-            },
+            # {"params": [self._xyz], "lr": training_args.position_lr_init * self.spatial_lr_scale,"name": "xyz"},
+            {"params": [self._features_dc], "lr": training_args.feature_lr, "name": "f_dc"},
+            {"params": [self._features_rest], "lr": training_args.feature_lr / 20.0, "name": "f_rest"},
+            # {"params": [self._opacity], "lr": training_args.opacity_lr, "name": "opacity"},
+            # {"params": [self._scaling], "lr": training_args.scaling_lr, "name": "scaling"},
+            {"params": [self._rotation], "lr": training_args.rotation_lr, "name": "rotation"},
         ]
         self.params_list = l
-        # self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)  # 原
-        self.optimizer = torch.optim.Adam(l, lr=0.001, eps=1e-15)
+        self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(
             lr_init=training_args.position_lr_init * self.spatial_lr_scale,
             lr_final=training_args.position_lr_final * self.spatial_lr_scale,

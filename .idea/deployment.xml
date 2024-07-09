@@ -1,7 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" serverName="yjx@10.12.13.103:22 key" remoteFilesAllowedToDisappearOnAutoupload="false">
+  <component name="PublishConfigData" serverName="A100" remoteFilesAllowedToDisappearOnAutoupload="false">
     <serverData>
+      <paths name="A100">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/desktop/style" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
       <paths name="yjx@10.12.13.103:22 key">
         <serverdata>
           <mappings>

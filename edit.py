@@ -1,4 +1,5 @@
 import os
+import cv2
 import torch
 import time
 import math
@@ -67,7 +68,7 @@ class editpara:
         self.anchor_weight_init_g0 = 0.05
         self.anchor_weight_init = 0.1
         self.anchor_weight_multiplier = 1.3
-        self.edit_train_steps = 30
+        self.edit_train_steps = 1000
         self.gs_lr_scaler = 3.0
         self.gs_lr_end_scaler = 2.0
         self.color_lr_scaler = 3.0
@@ -75,11 +76,11 @@ class editpara:
         self.scaling_lr_scaler = 2.0
         self.rotation_lr_scaler = 2.0
         self.sam_enabled = False
-        self.edit_cam_num = 1  # cam number
+        # self.edit_cam_num = 30  # cam number
         # guidance parameter
-        self.per_editing_step = 10
+        # self.per_editing_step = 30
         self.edit_begin_step = 0
-        self.edit_until_step = 1000
+        # self.edit_until_step = 30  # same with cam number will fast
         self.lambda_l1 = 10
         self.lambda_p = 10
         self.lambda_anchor_color = 0
@@ -116,9 +117,9 @@ class editpara:
         self.masks_2D = {}
 
         self.epoch = 0
-        self.text_segmentor = LangSAMTextSegmentor().to(get_device())
+        """self.text_segmentor = LangSAMTextSegmentor().to(get_device())
         self.sam_predictor = self.text_segmentor.model.sam
-        self.sam_predictor.is_image_set = True
+        self.sam_predictor.is_image_set = True"""
         self.sam_features = {}
         self.semantic_gauassian_masks = {}
         self.semantic_gauassian_masks["ALL"] = torch.ones_like(self.gaussian._opacity)
@@ -133,7 +134,10 @@ class editpara:
                 "Edit Type", ("Edit",)
             )
             self.guidance_type = self.server.add_gui_dropdown(
-                "Guidance Type", ("InstructPix2Pix", "instantstyle", "custom")
+                "Guidance Type", ("InstructPix2Pix", "instantstyle", "custom", "Instantstyle_InstructP2P")
+            )
+            self.edit_cam_num = self.server.add_gui_slider(
+                "Camera Nums", min=6, max=150, step=1, initial_value=30
             )
             self.edit_frame_show = self.server.add_gui_checkbox(
                 "Show Edit Frame", initial_value=True, visible=False
@@ -184,8 +188,10 @@ class editpara:
                 anchor_weight_multiplier=self.anchor_weight_multiplier,
             )
             self.edit_frame_show.visible = True
+            self.per_editing_step = self.edit_cam_num.value
+            self.edit_until_step = self.edit_cam_num.value
             edit_cameras, train_frames, train_frustums = ui_utils.sample_train_camera(self.colmap_cameras,
-                                                                                      self.edit_cam_num,
+                                                                                      self.edit_cam_num.value,
                                                                                       self.server)
             if self.edit_type.value == "Edit":
                 self.edit(edit_cameras, train_frames, train_frustums)
@@ -318,6 +324,7 @@ class editpara:
                 self.ip2p = InstructPix2PixGuidance(
                     OmegaConf.create({"min_step_percent": 0.02, "max_step_percent": 0.98})
                 )
+
             cur_2D_guidance = self.ip2p
             print("using InstructPix2Pix!")
         elif self.guidance_type.value == "instantstyle":
@@ -347,7 +354,17 @@ class editpara:
                 )
             cur_2D_guidance = self.ctn
             print("using customstyle!")
+        elif self.guidance_type.value == "Instantstyle_InstructP2P":
+            if not self.ip2p:
+                from threestudio.models.guidance.instantstyle_instruct_guidance import (
+                    InstantStyleGuidance,
+                )
 
+                self.ip2p = InstantStyleGuidance(
+                    OmegaConf.create({"min_step_percent": 0.02, "max_step_percent": 0.98})
+                )
+            cur_2D_guidance = self.ip2p
+            print("using  text InstructPix2Pix!")
         origin_frames = self.render_cameras_list(edit_cameras)  # 原始帧
         # * EditGuidance and cur_2D_guidance *
         self.guidance = CustomGuidance(
@@ -370,6 +387,11 @@ class editpara:
             server=self.server,
         )
         view_index_stack = list(range(len(edit_cameras)))
+        edge_maps = {}
+        for view_index in range(len(edit_cameras)):
+            rendering = self.render(edit_cameras[view_index], train=False)["comp_rgb"]  # 1 H W C
+            edge_maps[view_index] = self.edge_detection(rendering, view_index)
+
         for step in tqdm(range(self.edit_train_steps)):
             if not view_index_stack:
                 view_index_stack = list(range(len(edit_cameras)))
@@ -378,10 +400,11 @@ class editpara:
 
             rendering = self.render(edit_cameras[view_index], train=True)["comp_rgb"]  # 1 H W C
             self.save_rendering(rendering, view_index)
-            loss = self.guidance(rendering, view_index, step)
+            canny_map = edge_maps[view_index]  # canny map
+            loss = self.guidance(rendering, canny_map, view_index, step)
             # print("loss_sds:"+str(loss.item()))
-            # self.densify_and_prune(step)
             loss.backward()
+            # self.densify_and_prune(step)
             self.gaussian.optimizer.step()
             self.gaussian.optimizer.zero_grad(set_to_none=True)
 
@@ -389,19 +412,32 @@ class editpara:
                 self.stop_training = False
                 return
 
+    def edge_detection(self, image, view_index):
+        cond_rgb_numpy = image.cpu().detach().numpy()
+        cond_rgb_numpy = (cond_rgb_numpy * 255).astype(np.uint8)
+        # cv2.imwrite(f'cond_rgb_image_{view_index}.jpg', cv2.cvtColor(cond_rgb_numpy[0], cv2.COLOR_RGB2BGR))
+        retval, buffer = cv2.imencode('.jpg', cond_rgb_numpy[0])
+        rbimage = cv2.imdecode(buffer, cv2.IMREAD_COLOR)
+
+        detected_map = cv2.Canny(rbimage, 50, 200)
+        canny_map = Image.fromarray(cv2.cvtColor(detected_map, cv2.COLOR_BGR2RGB))
+        output_dir = "./renderings"
+        output_path = os.path.join(output_dir, f"canny_output_{view_index}.png")
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        canny_map.save(output_path)
+
+        return canny_map
+
     def save_rendering(self, rendering, view_index):
         # Assuming rendering is a tensor with shape (1, H, W, C)
         rendering = rendering.squeeze(0)  # Remove the batch dimension, new shape (H, W, C)
         rendering = rendering.detach().cpu().numpy()  # Convert to numpy array if it's a tensor
-
         # Convert rendering to uint8 if necessary (assuming rendering is in the range [0, 1])
         rendering = (rendering * 255).astype(np.uint8)
-
         # Convert to Image object and save
         image = Image.fromarray(rendering)
         output_dir = "./renderings"
         image_path = os.path.join(output_dir, f"rendering_{view_index}.png")
-        os.makedirs(os.path.dirname(image_path), exist_ok=True)
         image.save(image_path)
 
     @torch.no_grad()

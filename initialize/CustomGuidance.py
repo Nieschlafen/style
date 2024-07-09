@@ -1,4 +1,6 @@
-
+import torch
+import sys
+from diffusers.image_processor import VaeImageProcessor
 from threestudio.utils.misc import get_device
 from threestudio.utils.perceptual import PerceptualLoss
 from threestudio.models.prompt_processors.stable_diffusion_prompt_processor import StableDiffusionPromptProcessor
@@ -35,8 +37,9 @@ class CustomGuidance:
                 "prompt": text_prompt,
             }
         )()"""
+        self.perceptual_loss = PerceptualLoss().eval().to(get_device())
 
-    def __call__(self, rendering, view_index, step):
+    def __call__(self, rendering, canny_map, view_index, step):
         self.gaussian.update_learning_rate(step)
         self.global_step += 1
         # nerf2nerf loss
@@ -47,11 +50,20 @@ class CustomGuidance:
                 < self.edit_until_step
                 and step % self.per_editing_step == 0
         ):
-            loss, loss_dict = self.guidance(
+            result = self.guidance(
                 rendering,
-                self.global_step,
-                self.origin_frames[view_index],
+                view_index,
+                canny_map,
             )
+            self.edit_frames[view_index] = result["edit_images"].detach().clone() # 1 H W C
+            self.train_frustums[view_index].remove()
+            self.train_frustums[view_index] = ui_utils.new_frustums(view_index, self.train_frames[view_index],
+                                                                    self.cams[view_index], self.edit_frames[view_index], self.visible, self.server)
+        gt_image = self.edit_frames[view_index]
+
+        loss = self.lambda_l1 * torch.nn.functional.l1_loss(rendering, gt_image) + \
+               self.lambda_p * self.perceptual_loss(rendering.permute(0, 3, 1, 2).contiguous(),
+                                                    gt_image.permute(0, 3, 1, 2).contiguous(), ).sum()
         # anchor loss
         if (
                 self.lambda_anchor_color > 0
@@ -64,6 +76,9 @@ class CustomGuidance:
                     self.lambda_anchor_geo * anchor_out['loss_anchor_geo'] + \
                     self.lambda_anchor_opacity * anchor_out['loss_anchor_opacity'] + \
                     self.lambda_anchor_scale * anchor_out['loss_anchor_scale']
+
+        if step % self.per_editing_step == 0:
+            print("loss:" + str(loss.item()))
 
         return loss
 
